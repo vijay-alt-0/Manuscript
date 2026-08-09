@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Manuscript — Story Writer</title>
+
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Manuscript">
+<meta name="application-name" content="Manuscript">
+<meta name="theme-color" content="#1C1B19">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Manuscript">
+<meta name="description" content="Write stories with multiple drafts and per-section version history.">
+
+<link rel="manifest" href="./manifest.json">
+<!-- MANUSCRIPT V5: installable PWA shell; preserves V4 IndexedDB data. -->
+<link rel="icon" href="./icon.svg">
+<link rel="apple-touch-icon" href="./icon.svg">
+
+<script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin><!-- V4 menu correction: collapse control is rightmost; collapsed state hides Stories, Sections, and utility controls while preserving draft timeline and editor title/actions. -->
+</script>
+<script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js" crossorigin></script>
+
+<style>
+*{box-sizing:border-box}
+html,body,#root{height:100%;margin:0;padding:0}
+body{font-family:Inter,system-ui,sans-serif;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+button,input,textarea{font:inherit}
+button{touch-action:manipulation}
+
+@media print{
+  body{background:#fff!important}
+  body *{visibility:hidden!important}
+  #root, #root *{visibility:visible!important}
+  #root{height:auto!important;overflow:visible!important}
+  #root > div{display:block!important;height:auto!important;overflow:visible!important}
+  aside, header, button, textarea, input, .no-print{display:none!important}
+  main{display:block!important;overflow:visible!important}
+}
+/* V4 FINAL MENU RULE: Session Timer is independent of collapse and remains visible. */
+</style>
+
+
+<style id="v4-session-timer-rule">.session-timer,.sessionTimer,[data-session-timer="true"]{display:flex!important;visibility:visible!important}</style>
+</head>
+<body>
+
+
+<div id="root"><div style="padding:24px">Loading Manuscript…</div></div>
+
+<script>
+window.addEventListener("error",function(e){
+  const root=document.getElementById("root");
+  if(root&&!window.__manuscriptMounted){
+    root.innerHTML='<div style="padding:24px;font-family:monospace;white-space:pre-wrap"><b>Could not load Manuscript.</b>\\n\\n'+
+      (e.message||"Unknown error")+'</div>';
+  }
+});
+</script>
+
+<script type="text/babel" data-presets="react">
+const {useState,useRef,useEffect}=React;
+
+const uid=()=>Math.random().toString(36).slice(2,10);
+const now=()=>Date.now();
+const clone=o=>typeof structuredClone==="function"?structuredClone(o):JSON.parse(JSON.stringify(o));
+const fmtTime=ts=>new Date(ts).toLocaleString(undefined,{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+const fmtShort=ts=>new Date(ts).toLocaleTimeString(undefined,{hour:"numeric",minute:"2-digit"});
+const truncate=(s,n)=>s.length>n?s.slice(0,n).trimEnd()+"…":s;
+
+const STORAGE_KEY="manuscript:stories";
+const DARK_KEY="manuscript:dark";
+const DAILY_KEY="manuscript:daily-stats";
+const DB_NAME="ManuscriptDB";
+const DB_VERSION=1;
+const BACKUP_STORE="backups";
+const STORY_STORE="stories";
+const AUTO_BACKUP_LIMIT=15;
+const AUTO_BACKUP_INTERVAL=20*60*1000;
+const HISTORY_LIMIT=100;
+const todayKey=()=>new Date().toISOString().slice(0,10);
+const countWords=text=>{
+  const s=String(text||"").trim();
+  return s?s.split(/\s+/).length:0;
+};
+function openDB(){return new Promise((resolve,reject)=>{const r=indexedDB.open(DB_NAME,DB_VERSION);r.onupgradeneeded=()=>{const db=r.result;if(!db.objectStoreNames.contains(STORY_STORE))db.createObjectStore(STORY_STORE,{keyPath:"key"});if(!db.objectStoreNames.contains(BACKUP_STORE))db.createObjectStore(BACKUP_STORE,{keyPath:"id"});};r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});}
+async function dbGet(store,key){const db=await openDB();return new Promise((res,rej)=>{const r=db.transaction(store,"readonly").objectStore(store).get(key);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+async function dbPut(store,obj){const db=await openDB();return new Promise((res,rej)=>{const r=db.transaction(store,"readwrite").objectStore(store).put(obj);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+async function dbAll(store){const db=await openDB();return new Promise((res,rej)=>{const r=db.transaction(store,"readonly").objectStore(store).getAll();r.onsuccess=()=>res(r.result||[]);r.onerror=()=>rej(r.error);});}
+async function dbDelete(store,key){const db=await openDB();return new Promise((res,rej)=>{const r=db.transaction(store,"readwrite").objectStore(store).delete(key);r.onsuccess=()=>res();r.onerror=()=>rej(r.error);});}
+async function saveProjectIDB(stories){try{return await dbPut(STORY_STORE,{key:"current",stories});}catch(e){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(stories));return true;}catch(err){throw e;}}}
+async function loadProjectIDB(){try{const r=await dbGet(STORY_STORE,"current");if(r?.stories?.order?.length)return r.stories;}catch(e){}try{const raw=localStorage.getItem(STORAGE_KEY);if(raw){const x=JSON.parse(raw);if(x?.order?.length){try{await dbPut(STORY_STORE,{key:"current",stories:x});}catch(e){}return x;}}}catch(e){}return null;}
+async function createBackup(stories,reason){try{const b={id:uid(),timestamp:now(),reason,stories:clone(stories)};await dbPut(BACKUP_STORE,b);if(reason==="Auto-backup"){const autos=(await dbAll(BACKUP_STORE)).filter(x=>x.reason==="Auto-backup").sort((a,b)=>b.timestamp-a.timestamp);for(const old of autos.slice(AUTO_BACKUP_LIMIT))await dbDelete(BACKUP_STORE,old.id);}return b;}catch(e){return null;}}
+function validateProject(x){return !!(x&&Array.isArray(x.order)&&x.byId&&x.order.every(id=>x.byId[id]?.sections&&x.byId[id]?.drafts));}
+function exportProjectBackup(stories,label="manual"){download(JSON.stringify({format:"Manuscript Project Backup",version:5,exportedAt:now(),stories},null,2),`Manuscript_${label}_backup_${new Date().toISOString().replace(/[:.]/g,"-")}.json`,"application/json");}
+
+const LIGHT={
+  paper:"#FBFAF7",paperDim:"#F3F0E9",ink:"#1C1B19",inkSoft:"#5B5850",
+  sienna:"#8B6F5C",siennaLight:"#EFE6DC",rule:"#DCD5C6",moss:"#4A5D52",
+  danger:"#A14C3E"
+};
+const DARK={
+  paper:"#191817",paperDim:"#242220",ink:"#F3F0E9",inkSoft:"#B7B1A7",
+  sienna:"#C5A38B",siennaLight:"#332A24",rule:"#403B35",moss:"#8BA996",
+  danger:"#D98778"
+};
+
+function seedStory(){
+  const s1=uid(),s2=uid(),s3=uid();
+  const v1a=uid(),v1b=uid(),v2a=uid(),v3a=uid(),d1=uid();
+  const t0=now()-1000*60*60*24*3;
+  return {
+    id:uid(),title:"The Lighthouse Keeper's Debt",createdAt:t0,
+    sections:{order:[s1,s2,s3],byId:{
+      [s1]:{id:s1,name:"Opening",variants:{order:[v1a,v1b],byId:{
+        [v1a]:{id:v1a,text:"The lighthouse had not gone dark in forty years, and Mira intended to keep it that way, debt collectors or no.",createdAt:t0,note:"First pass"},
+        [v1b]:{id:v1b,text:"Mira counted the storm by its flashes: one, the bank's letter on the table; two, the empty oil drum; three, the light, still burning.",createdAt:t0+18000000,note:"Tried opening on an image instead of exposition"}
+      }}},
+      [s2]:{id:s2,name:"The Visitor",variants:{order:[v2a],byId:{
+        [v2a]:{id:v2a,text:"A man in a wet coat climbed the spiral stairs and did not introduce himself before asking for the ledger.",createdAt:t0+72000000,note:"First pass"}
+      }}},
+      [s3]:{id:s3,name:"The Reveal",variants:{order:[v3a],byId:{
+        [v3a]:{id:v3a,text:"The debt was never the bank's. It was her father's, and he had paid it in full the night he drowned.",createdAt:t0+108000000,note:"First pass"}
+      }}}
+    }},
+    drafts:{order:[d1],byId:{
+      [d1]:{id:d1,name:"Draft 1",createdAt:t0,selections:{[s1]:v1a,[s2]:v2a,[s3]:v3a}}
+    }},
+    activeDraftId:d1
+  };
+}
+
+function makeNewStory(){
+  const id=uid(),s=uid(),v=uid(),d=uid(),t=now();
+  return {
+    id,title:"Untitled Story",createdAt:t,
+    sections:{order:[s],byId:{
+      [s]:{id:s,name:"Opening",variants:{order:[v],byId:{
+        [v]:{id:v,text:"",createdAt:t,note:"First pass"}
+      }}}
+    }},
+    drafts:{order:[d],byId:{
+      [d]:{id:d,name:"Draft 1",createdAt:t,selections:{[s]:v}}
+    }},
+    activeDraftId:d
+  };
+}
+
+function StoryApp(){
+  const [stories,setStories]=useState({order:[],byId:{}});
+  const [activeStoryId,setActiveStoryId]=useState(null);
+  const [activeSectionId,setActiveSectionId]=useState(null);
+  const [view,setView]=useState("edit");
+  const [sidebarOpen,setSidebarOpen]=useState(true);
+  const [railOpen,setRailOpen]=useState(true);
+  const [darkMode,setDarkMode]=useState(()=>localStorage.getItem(DARK_KEY)==="1");
+  const [loaded,setLoaded]=useState(false);
+  const [saveState,setSaveState]=useState("idle");
+  const [backupOpen,setBackupOpen]=useState(false);
+  const [backups,setBackups]=useState([]);
+  const [searchOpen,setSearchOpen]=useState(false);
+  const [dailyWords,setDailyWords]=useState(()=>{
+    try{
+      const raw=JSON.parse(localStorage.getItem(DAILY_KEY)||"null");
+      return raw&&raw.date===todayKey()&&Number.isFinite(raw.words)?raw.words:0;
+    }catch(e){return 0}
+  });
+  const timer=useRef(null);
+  const C=darkMode?DARK:LIGHT;
+
+  useEffect(()=>{(async()=>{
+    try{const parsed=await loadProjectIDB();if(parsed){setStories(parsed);setActiveStoryId(parsed.order[0]);setLoaded(true);return;}}catch(e){}
+    const s=seedStory(),x={order:[s.id],byId:{[s.id]:s}};
+    try{await saveProjectIDB(x)}catch(e){}
+    setStories(x);setActiveStoryId(s.id);setLoaded(true);
+  })();},[]);
+
+  useEffect(()=>{
+    try{localStorage.setItem(DARK_KEY,darkMode?"1":"0")}catch(e){}
+  },[darkMode]);
+
+  useEffect(()=>{
+    if(!loaded)return;
+    setSaveState("saving");
+    clearTimeout(timer.current);
+    timer.current=setTimeout(()=>{
+      try{saveProjectIDB(stories).then(()=>setSaveState("saved"));clearTimeout(window.__manuscriptBackupTimer);window.__manuscriptBackupTimer=setTimeout(async()=>{const key="manuscript_v4_last_auto_backup";const last=Number(localStorage.getItem(key)||0);const nowTs=Date.now();if(nowTs-last>=AUTO_BACKUP_INTERVAL){const b=await createBackup(stories,"Auto-backup");if(b){localStorage.setItem(key,String(nowTs));setBackups((await dbAll(BACKUP_STORE)).sort((a,b)=>b.timestamp-a.timestamp));}}},1000)}
+      catch(e){setSaveState("error")}
+    },350);
+    return()=>clearTimeout(timer.current);
+  },[stories,loaded]);
+
+  useEffect(()=>{
+    try{localStorage.setItem(DAILY_KEY,JSON.stringify({date:todayKey(),words:dailyWords}))}catch(e){}
+  },[dailyWords]);
+
+  useEffect(()=>{if(loaded)dbAll(BACKUP_STORE).then(x=>setBackups(x.sort((a,b)=>b.timestamp-a.timestamp))).catch(()=>{});},[loaded]);
+
+  const recordWords=(delta)=>{
+    const n=Math.max(0,Math.floor(Number(delta)||0));
+    if(n)setDailyWords(v=>v+n);
+  };
+
+  const story=stories.byId[activeStoryId];
+
+  useEffect(()=>{
+    if(story){
+      const valid=story.sections.order.includes(activeSectionId);
+      if(!valid)setActiveSectionId(story.sections.order[0]||null);
+    }
+  },[story,activeSectionId]);
+
+  const updateStory=fn=>{
+    setStories(prev=>{
+      if(!prev.byId[activeStoryId])return prev;
+      const next={...prev,byId:{...prev.byId}};
+      next.byId[activeStoryId]=fn(clone(next.byId[activeStoryId]));
+      return next;
+    });
+  };
+
+  const newStory=()=>{
+    const s=makeNewStory();
+    setStories(p=>({order:[...p.order,s.id],byId:{...p.byId,[s.id]:s}}));
+    setActiveStoryId(s.id);setActiveSectionId(s.sections.order[0]);setView("edit");
+  };
+
+  const deleteStory=id=>{
+    if(stories.order.length<=1)return;
+    if(!confirm("Delete this story? This cannot be undone."))return;
+    setStories(prev=>{
+      const order=prev.order.filter(x=>x!==id),byId={...prev.byId};
+      delete byId[id];
+      if(id===activeStoryId){
+        setActiveStoryId(order[0]);setActiveSectionId(null);
+      }
+      return{order,byId};
+    });
+  };
+
+  if(!loaded)return <div style={baseApp(C)}>Loading your stories…</div>;
+  if(!story)return null;
+  const draft=story.drafts.byId[story.activeDraftId];
+
+  return <div style={baseApp(C)}>
+    {sidebarOpen&&<Sidebar C={C} stories={stories} activeStoryId={activeStoryId}
+      setActiveStoryId={id=>{setActiveStoryId(id);setActiveSectionId(null)}}
+      newStory={newStory} deleteStory={deleteStory} saveState={saveState}
+      onClose={()=>setSidebarOpen(false)}/>}
+    <main style={S.main}>
+      <TopBar C={C} story={story} draft={draft} view={view} setView={setView}
+        updateStory={updateStory} sidebarOpen={sidebarOpen} setSidebarOpen={setSidebarOpen}
+        railOpen={railOpen} setRailOpen={setRailOpen} darkMode={darkMode}
+        setDarkMode={setDarkMode} dailyWords={dailyWords} onBackup={()=>setBackupOpen(true)} onSearch={()=>setSearchOpen(true)}/>
+      {view==="edit"
+        ?<EditView C={C} story={story} draft={draft} updateStory={updateStory}
+          recordWords={recordWords}
+          activeSectionId={activeSectionId} setActiveSectionId={setActiveSectionId}
+          railOpen={railOpen}/>
+        :<FinalView C={C} story={story} draft={draft}/>}
+    </main>
+    {backupOpen&&<BackupPanel C={C} stories={stories} backups={backups} onClose={()=>setBackupOpen(false)} onRefresh={()=>dbAll(BACKUP_STORE).then(x=>setBackups(x.sort((a,b)=>b.timestamp-a.timestamp)))} onRestore={item=>{if(!confirm("Restore this backup? An emergency backup will be created first."))return;createBackup(stories,"Emergency backup before restore").then(()=>{setStories(clone(item.stories));setActiveStoryId(item.stories.order[0]);setActiveSectionId(item.stories.byId[item.stories.order[0]].sections.order[0]);setBackupOpen(false);});}}/>}
+    {searchOpen&&<SearchPanel C={C} stories={stories} activeStoryId={activeStoryId} setStories={setStories} onClose={()=>setSearchOpen(false)}/>}
+  </div>;
+}
+
+function Sidebar({C,stories,activeStoryId,setActiveStoryId,newStory,deleteStory,saveState,onClose}){
+  const label=saveState==="saving"?"Saving…":saveState==="error"?"Save failed — storage may be full or disabled":"Saved on this device";
+  const color=saveState==="error"?C.danger:saveState==="saving"?C.inkSoft:C.moss;
+  return <aside style={S.sidebar(C)}>
+    <div style={S.sidebarHeader}>
+      <div><span style={S.brandMark(C)}>§</span><span style={S.brandText(C)}>Manuscript</span></div>
+      <button style={S.smallBtn(C)} onClick={onClose}>‹</button>
+    </div>
+    <button style={S.newBtn(C)} onClick={newStory}>+ New story</button>
+    <div style={S.storyList}>
+      {stories.order.map(id=>{
+        const s=stories.byId[id],active=id===activeStoryId;
+        return <div key={id} onClick={()=>setActiveStoryId(id)} style={S.storyItem(C,active)}>
+          <div style={S.row}><div style={S.storyTitle}>{s.title||"Untitled Story"}</div>
+          {stories.order.length>1&&<button style={S.iconBtn(C)} onClick={e=>{e.stopPropagation();deleteStory(id)}}>×</button>}</div>
+          <div style={S.meta(C)}>{s.drafts.order.length} draft{s.drafts.order.length!==1?"s":""}</div>
+        </div>;
+      })}
+    </div>
+    <div style={S.save(C)}><span style={{...S.dot,background:color}}/><span style={{fontSize:11,color}}>{label}</span></div>
+  </aside>;
+}
+
+function WritingTimer({C}){
+  const [seconds,setSeconds]=useState(()=>{
+    try{return Math.max(0,Number(localStorage.getItem("manuscript:session-seconds")||0))}catch(e){return 0}
+  });
+  const [running,setRunning]=useState(false);
+  const timerRef=useRef(null);
+
+  useEffect(()=>{
+    if(!running)return;
+    timerRef.current=setInterval(()=>setSeconds(v=>v+1),1000);
+    return()=>clearInterval(timerRef.current);
+  },[running]);
+
+  useEffect(()=>{
+    try{localStorage.setItem("manuscript:session-seconds",String(seconds))}catch(e){}
+  },[seconds]);
+
+  const h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=seconds%60;
+  const display=[h,m,s].map((x,i)=>i===0?String(x):String(x).padStart(2,"0")).join(":");
+  return <div style={S.timerBox(C)} title="Session writing timer">
+    <span style={S.timerLabel(C)}>SESSION</span>
+    <b style={S.timerValue(C)}>{display}</b>
+    <button style={S.timerBtn(C)} onClick={()=>setRunning(v=>!v)}>{running?"Pause":"Start"}</button>
+    <button style={S.timerReset(C)} onClick={()=>{setRunning(false);setSeconds(0)}}>Reset</button>
+  </div>;
+}
+
+function TopBar({C,story,draft,view,setView,updateStory,sidebarOpen,setSidebarOpen,railOpen,setRailOpen,darkMode,setDarkMode,dailyWords,onBackup,onSearch}){
+  const [editing,setEditing]=useState(false),[title,setTitle]=useState(story.title);
+  const [installPrompt,setInstallPrompt]=useState(null);
+  const [online,setOnline]=useState(()=>navigator.onLine);
+  const [editingDraft,setEditingDraft]=useState(null),[draftName,setDraftName]=useState("");
+  const [menu,setMenu]=useState(null);
+  const [menusCollapsed,setMenusCollapsed]=useState(false);
+  useEffect(()=>setTitle(story.title),[story.id,story.title]);
+  useEffect(()=>{
+    const onPrompt=e=>{e.preventDefault();setInstallPrompt(e)};
+    const onInstalled=()=>setInstallPrompt(null);
+    const onOnline=()=>setOnline(true),onOffline=()=>setOnline(false);
+    window.addEventListener("beforeinstallprompt",onPrompt);
+    window.addEventListener("appinstalled",onInstalled);
+    window.addEventListener("online",onOnline);
+    window.addEventListener("offline",onOffline);
+    return()=>{window.removeEventListener("beforeinstallprompt",onPrompt);window.removeEventListener("appinstalled",onInstalled);window.removeEventListener("online",onOnline);window.removeEventListener("offline",onOffline)};
+  },[]);
+  const installApp=async()=>{
+    if(!installPrompt){alert("If Install is not offered here, open Manuscript from Chrome over HTTPS or localhost, then use Chrome’s ⋮ menu → Install app / Add to Home screen.");return;}
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    setInstallPrompt(null);
+  };
+  const commitTitle=()=>{updateStory(s=>{s.title=title.trim()||"Untitled Story";return s});setEditing(false)};
+  const addDraft=()=>{updateStory(s=>{const id=uid(),base=s.drafts.byId[s.activeDraftId],num=s.drafts.order.length+1;s.drafts.byId[id]={id,name:`Draft ${num}`,createdAt:now(),selections:{...base.selections}};s.drafts.order.push(id);s.activeDraftId=id;return s})};
+  const startRenameDraft=id=>{setEditingDraft(id);setDraftName(story.drafts.byId[id]?.name||"")};
+  const commitDraft=()=>{if(!editingDraft)return;updateStory(s=>{const d=s.drafts.byId[editingDraft];if(d)d.name=draftName.trim()||d.name||"Untitled Draft";return s});setEditingDraft(null)};
+  const deleteDraft=id=>{updateStory(s=>{if(s.drafts.order.length<=1)return s;s.drafts.order=s.drafts.order.filter(x=>x!==id);delete s.drafts.byId[id];if(s.activeDraftId===id)s.activeDraftId=s.drafts.order[0];return s})};
+  const closeMenus=()=>setMenu(null);
+  return <header style={S.top(C)} onClick={e=>{if(e.target===e.currentTarget)closeMenus()}}>
+    <div style={{...S.titleRow,alignItems:"center",gap:10,position:"relative"}}>
+      {!menusCollapsed&&<>
+        {sidebarOpen
+          ? <button style={S.outline(C)} onClick={()=>setSidebarOpen(false)}>Stories</button>
+          : <button style={S.outline(C)} onClick={()=>setSidebarOpen(true)}>☰ Stories</button>}
+        <button style={S.outline(C)} onClick={()=>setRailOpen(!railOpen)}>{railOpen?"Sections":"› Sections"}</button>
+      </>}
+      {editing?<input autoFocus value={title} onChange={e=>setTitle(e.target.value)} onBlur={commitTitle} onKeyDown={e=>e.key==="Enter"&&commitTitle()} style={S.titleInput(C)}/>:<h1 style={S.title(C)} onClick={()=>setEditing(true)}>{story.title}</h1>}
+      <div style={{...S.toggle(C),marginLeft:"auto",flexShrink:0}}>
+        <button style={S.toggleBtn(C,view==="edit")} onClick={()=>{setView("edit");closeMenus()}}>Edit</button>
+        <button style={S.toggleBtn(C,view==="final")} onClick={()=>{setView("final");closeMenus()}}>Read final</button>
+      </div>
+    </div>
+
+    <div style={{...S.utilityRow,justifyContent:"flex-end",alignItems:"center",gap:8,marginTop:8,overflowX:"auto",paddingBottom:2}}>
+      <WritingTimer C={C}/>
+      {!menusCollapsed&&<>
+        <div style={S.dailyBox(C)}><span style={S.timerLabel(C)}>TODAY</span><b>{dailyWords.toLocaleString()}</b><span style={S.meta(C)}>words added</span></div>
+        <button style={S.outline(C)} onClick={onBackup}>🛡 Safety ▾</button>
+        <div style={{position:"relative",flexShrink:0}}>
+          <button style={S.outline(C)} onClick={()=>setMenu(menu==="tools"?null:"tools")}>⚙ Tools ▾</button>
+          {menu==="tools"&&<div style={{...S.menuDrop(C),right:0,left:"auto"}}>
+            <button style={S.menuItem(C)} onClick={()=>{onSearch();closeMenus()}}>⌕ Search &amp; Find / Replace</button>
+            <button style={S.menuItem(C)} onClick={()=>{setDarkMode(!darkMode);closeMenus()}}>{darkMode?"☀ Light mode":"☾ Dark mode"}</button>
+            <button style={S.menuItem(C)} onClick={()=>{window.print();closeMenus()}}>🖨 Print</button>
+            <div style={{height:1,background:C.rule,margin:"4px 0"}}/>
+            <button style={S.menuItem(C)} onClick={()=>{installApp();closeMenus()}}>📲 Install Manuscript</button>
+            <div style={{padding:"7px 10px",fontFamily:"monospace",fontSize:9.5,color:C.inkSoft}}>● {online?"Online · offline shell cached when available":"Offline mode"}</div>
+          </div>}
+        </div>
+      </>}
+      <button
+        style={{...S.outline(C),padding:"6px 9px",fontSize:18,lineHeight:1,flexShrink:0}}
+        title={menusCollapsed?"Show menu":"Collapse menu"}
+        aria-label={menusCollapsed?"Show menu":"Collapse menu"}
+        onClick={()=>{setMenusCollapsed(v=>!v);closeMenus()}}
+      >☰</button>
+    </div>
+
+    <div style={S.draftRow}><span style={S.meta(C)}>DRAFT TIMELINE</span><div style={S.pills}>{story.drafts.order.map(id=>{const d=story.drafts.byId[id],active=id===story.activeDraftId;if(editingDraft===id)return <div key={id} style={S.renameDraftBox(C)}><input autoFocus value={draftName} onChange={e=>setDraftName(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")commitDraft();if(e.key==="Escape")setEditingDraft(null)}} style={S.pillInput(C)}/><button style={S.miniAction(C)} onClick={commitDraft}>Save</button><button style={S.miniAction(C)} onClick={()=>setEditingDraft(null)}>Cancel</button></div>;return <div key={id} style={S.pill(C,active)}><div onClick={()=>updateStory(s=>{s.activeDraftId=id;return s})} style={S.pillMain}><span>{d.name}</span><span style={S.pillTime(C)}>{fmtShort(d.createdAt)}</span></div><button title="Rename draft" style={S.pillEdit(C)} onClick={e=>{e.stopPropagation();startRenameDraft(id)}}>✎</button>{story.drafts.order.length>1&&<button title="Delete draft" style={S.pillDelete(C)} onClick={e=>{e.stopPropagation();if(confirm("Delete this draft?"))deleteDraft(id)}}>×</button>}</div>})}<button style={S.addPill(C)} onClick={addDraft}>+ Fork draft</button></div></div>
+  </header>;
+}
+function EditView({C,story,draft,updateStory,activeSectionId,setActiveSectionId,railOpen,recordWords}){
+  const addSection=()=>{
+    updateStory(s=>{
+      const id=uid(),v=uid();
+      s.sections.byId[id]={id,name:`Section ${s.sections.order.length+1}`,status:"Draft",variants:{order:[v],byId:{[v]:{id:v,text:"",createdAt:now(),note:"First pass"}}}};
+      s.sections.order.push(id);
+      s.drafts.order.forEach(d=>s.drafts.byId[d].selections[id]=v);
+      return s;
+    });
+  };
+  const section=story.sections.byId[activeSectionId];
+  return <div style={S.editGrid}>
+    {railOpen&&<SectionRail C={C} story={story} draft={draft} activeSectionId={activeSectionId}
+      setActiveSectionId={setActiveSectionId} addSection={addSection} updateStory={updateStory}/>}
+    {section?<SectionWorkspace C={C} story={story} draft={draft} section={section} updateStory={updateStory} recordWords={recordWords} wide={!railOpen}/>
+      :<div style={S.empty(C)}>Select or add a section to begin.</div>}
+  </div>;
+}
+
+function SectionRail({C,story,draft,activeSectionId,setActiveSectionId,addSection,updateStory}){
+  const move=(id,dir)=>{
+    updateStory(s=>{
+      const a=s.sections.order,i=a.indexOf(id),j=i+dir;
+      if(j<0||j>=a.length)return s;[a[i],a[j]]=[a[j],a[i]];return s;
+    });
+  };
+  return <aside style={S.rail(C)}>
+    <div style={S.heading(C)}>Sections</div>
+    <div style={S.railList}>
+      {story.sections.order.map((id,i)=>{
+        const sec=story.sections.byId[id],active=id===activeSectionId, count=sec.variants.order.length,sel=draft.selections[id];
+        return <div key={id} style={S.railItem(C,active)} onClick={()=>setActiveSectionId(id)}>
+          <div style={S.railTop}><span style={S.index(C)}>{String(i+1).padStart(2,"0")}</span><span>{sec.name}</span></div>
+          <div style={S.meta(C)}>{sec.status||"Draft"} · {count} version{count!==1?"s":""} · using {sec.variants.order.indexOf(sel)+1}</div>
+          <div style={S.moveRow}>
+            <button style={S.moveBtn(C)} onClick={e=>{e.stopPropagation();move(id,-1)}}>↑</button>
+            <button style={S.moveBtn(C)} onClick={e=>{e.stopPropagation();move(id,1)}}>↓</button>
+          </div>
+        </div>;
+      })}
+    </div>
+    <button style={S.addSection(C)} onClick={addSection}>+ Add section</button>
+  </aside>;
+}
+
+function SectionWorkspace({C,story,draft,section,updateStory,recordWords,wide}){
+  const selected=draft.selections[section.id];
+  const [text,setText]=useState(section.variants.byId[selected]?.text||"");
+  const [dirty,setDirty]=useState(false),[editingNote,setEditingNote]=useState(null),[note,setNote]=useState("");
+  const [nameEdit,setNameEdit]=useState(false),[name,setName]=useState(section.name),[status,setStatus]=useState(section.status||"Draft");
+  const [compare,setCompare]=useState(null),[restoreOpen,setRestoreOpen]=useState(null);
+  const history=useRef({}),timer=useRef(null),textRef=useRef(text);textRef.current=text;
+  const ensure=v=>{if(!history.current[v])history.current[v]={past:[],future:[],baseline:section.variants.byId[v]?.text||"",last:section.variants.byId[v]?.text||"",lastTyped:0};return history.current[v];};
+  useEffect(()=>{const v=draft.selections[section.id];setText(section.variants.byId[v]?.text||"");setDirty(false);setStatus(section.status||"Draft");ensure(v);},[section.id,draft.selections[section.id],section.status]);
+  useEffect(()=>setName(section.name),[section.id,section.name]);
+  const checkpoint=v=>{const h=ensure(v),cur=textRef.current;if(h.last===cur)return;h.past.push(h.last);if(h.past.length>HISTORY_LIMIT)h.past.shift();h.future=[];h.last=cur;h.lastTyped=now();};
+  const schedule=v=>{clearTimeout(timer.current);timer.current=setTimeout(()=>checkpoint(v),40000);};
+  const changeText=next=>{const old=textRef.current;const delta=Math.max(0,countWords(next)-countWords(old));if(delta)recordWords(delta);setText(next);setDirty(true);const h=ensure(selected);h.lastTyped=now();schedule(selected);if(now()-(h.lastCheckpoint||0)>=300000){checkpoint(selected);h.lastCheckpoint=now();}};
+  const undo=()=>{clearTimeout(timer.current);const h=ensure(selected),cur=textRef.current;if(h.last!==cur)checkpoint(selected);const prev=h.past.length?h.past.pop():h.baseline;if(prev===cur)return;h.future.push(cur);h.last=prev;setText(prev);setDirty(true);};
+  const redo=()=>{const h=ensure(selected);if(!h.future.length)return;const cur=textRef.current,next=h.future.pop();h.past.push(cur);h.last=next;setText(next);setDirty(true);};
+  const commitName=()=>{updateStory(s=>{s.sections.byId[section.id].name=name.trim()||"Untitled section";return s});setNameEdit(false);};
+  const saveNew=()=>{if(!dirty)return;updateStory(s=>{const id=uid(),sec=s.sections.byId[section.id];sec.variants.byId[id]={id,text:textRef.current,createdAt:now(),note:"",restoredFrom:null};sec.variants.order.push(id);s.drafts.byId[draft.id].selections[section.id]=id;return s});setDirty(false);};
+  const overwrite=()=>{if(!dirty)return;updateStory(s=>{s.sections.byId[section.id].variants.byId[selected].text=textRef.current;return s});const h=ensure(selected);h.past=[];h.future=[];h.last=textRef.current;setDirty(false);};
+  const choose=v=>{if(dirty&&!confirm("You have unsaved changes. Discard them?"))return;clearTimeout(timer.current);updateStory(s=>{s.drafts.byId[draft.id].selections[section.id]=v;return s});};
+  const del=v=>updateStory(s=>{const sec=s.sections.byId[section.id];if(sec.variants.order.length<=1)return s;sec.variants.order=sec.variants.order.filter(x=>x!==v);delete sec.variants.byId[v];s.drafts.order.forEach(d=>{if(s.drafts.byId[d].selections[section.id]===v)s.drafts.byId[d].selections[section.id]=sec.variants.order[0]});return s});
+  const commitNote=v=>{updateStory(s=>{s.sections.byId[section.id].variants.byId[v].note=note.trim();return s});setEditingNote(null);};
+  const restoreVersion=v=>{const source=section.variants.byId[v];updateStory(s=>{const sec=s.sections.byId[section.id],id=uid();sec.variants.byId[id]={id,text:source.text,createdAt:now(),note:`Restored from Version ${sec.variants.order.indexOf(v)+1}`,restoredFrom:v};sec.variants.order.push(id);s.drafts.byId[draft.id].selections[section.id]=id;return s});setRestoreOpen(null);};
+  const setSectionStatus=v=>{setStatus(v);updateStory(s=>{s.sections.byId[section.id].status=v;return s});};
+  const h=ensure(selected),canUndo=!!(h.past.length||(dirty&&h.last!==text)),canRedo=!!h.future.length,words=countWords(text);
+  return <section style={S.workspace(C)}><div style={{...S.workspaceInner,...(wide?S.wide:{})}}>
+    <div style={S.workspaceHeader}>{nameEdit?<input autoFocus value={name} onChange={e=>setName(e.target.value)} onBlur={commitName} onKeyDown={e=>e.key==="Enter"&&commitName()} style={S.sectionInput(C)}/>:<h2 style={S.sectionName(C)} onClick={()=>setNameEdit(true)}>{section.name}</h2>}<span style={S.meta(C)}>in {draft.name} · version {section.variants.order.indexOf(selected)+1} of {section.variants.order.length}</span><select value={status} onChange={e=>setSectionStatus(e.target.value)} style={S.statusSelect(C)}><option>Draft</option><option>In Progress</option><option>Final</option></select></div>
+    <div style={S.editorTools(C)}><button disabled={!canUndo} style={S.historyBtn(C,canUndo)} onClick={undo}>↶ Undo</button><button disabled={!canRedo} style={S.historyBtn(C,canRedo)} onClick={redo}>↷ Redo</button><span style={S.historyInfo(C)}>This version · checkpoint after 40s of inactivity</span></div>
+    <textarea style={S.textarea(C)} value={text} onChange={e=>changeText(e.target.value)} placeholder="Write this section…" spellCheck/><div style={S.wordCount(C)}>{words} word{words!==1?"s":""}</div>
+    <div style={S.actionRow}><button style={S.primary(C,dirty)} disabled={!dirty} onClick={saveNew}>Save as new version</button><button style={S.ghost(C,dirty)} disabled={!dirty} onClick={overwrite}>Overwrite this version</button>{dirty&&<span style={S.meta(C)}>Unsaved changes</span>}</div>
+    <div style={{marginTop:30}}><div style={S.heading(C)}>Version history for this section</div>{section.variants.order.map((vId,i)=>{const v=section.variants.byId[vId],active=vId===selected;return <div key={vId} style={S.versionRow}><div style={S.track(C)}><div style={S.dot(C,active)}/>{i<section.variants.order.length-1&&<div style={S.line(C)}/>}</div><div style={S.card(C,active)}><div onClick={()=>choose(vId)}><div style={S.cardTop}><b>Version {i+1}</b><span style={S.meta(C)}>{fmtTime(v.createdAt)}</span></div><div style={S.preview(C)}>{v.text?truncate(v.text,160):"(empty)"}</div></div><div style={S.cardBottom}>{editingNote===vId?<div style={S.noteEditor}><input autoFocus value={note} onChange={e=>setNote(e.target.value)} onClick={e=>e.stopPropagation()} onKeyDown={e=>e.key==="Enter"&&commitNote(vId)} placeholder="Add a note…" style={S.noteInput(C)}/><button style={S.miniAction(C)} onClick={e=>{e.stopPropagation();commitNote(vId)}}>Save</button><button style={S.miniAction(C)} onClick={e=>{e.stopPropagation();setEditingNote(null)}}>Cancel</button></div>:<button style={S.note(C)} onClick={e=>{e.stopPropagation();setEditingNote(vId);setNote(v.note||"")}}>{v.note||"＋ Add/edit note"}</button>}<div style={S.versionActions}><button style={S.miniAction(C)} onClick={e=>{e.stopPropagation();setCompare(vId)}}>Compare</button><button style={S.miniAction(C)} onClick={e=>{e.stopPropagation();setRestoreOpen(vId)}}>Restore</button>{section.variants.order.length>1&&<button style={S.deleteText(C)} onClick={e=>{e.stopPropagation();del(vId)}}>Delete</button>}</div></div></div></div>})}</div>
+    {compare&&<CompareDialog C={C} section={section} selected={selected} other={compare} onClose={()=>setCompare(null)}/>} {restoreOpen&&<RestoreDialog C={C} versionNumber={section.variants.order.indexOf(restoreOpen)+1} onClose={()=>setRestoreOpen(null)} onRestore={()=>restoreVersion(restoreOpen)}/>}</div></section>;
+}
+function CompareDialog({C,section,selected,other,onClose}){const a=section.variants.byId[selected],b=section.variants.byId[other];return <div style={S.modalBackdrop}><div style={S.modal(C)}><div style={S.modalHead}><b>Compare versions</b><button style={S.iconBtn(C)} onClick={onClose}>×</button></div><div style={S.compareGrid}><div><div style={S.heading(C)}>Version {section.variants.order.indexOf(selected)+1}</div><pre style={S.comparePane(C)}>{a?.text||""}</pre></div><div><div style={S.heading(C)}>Version {section.variants.order.indexOf(other)+1}</div><pre style={S.comparePane(C)}>{b?.text||""}</pre></div></div><div style={S.modalFoot}><span style={S.meta(C)}>Read-only comparison.</span><button style={S.miniAction(C)} onClick={onClose}>Close</button></div></div></div>}
+function RestoreDialog({C,versionNumber,onClose,onRestore}){return <div style={S.modalBackdrop}><div style={S.modal(C)}><b>Restore Version {versionNumber}?</b><p style={S.modalText(C)}>This creates a new version from the old content. The original remains unchanged.</p><div style={S.modalFoot}><button style={S.miniAction(C)} onClick={onClose}>Cancel</button><button style={S.primary(C,true)} onClick={onRestore}>Create restored version</button></div></div></div>}
+
+function assemble(story,draft){
+  return story.sections.order.map(id=>{
+    const sec=story.sections.byId[id],v=sec.variants.byId[draft.selections[id]];
+    return{name:sec.name,text:v?.text||""};
+  });
+}
+function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
+function safeName(s){return s.replace(/[^\w\- ]/g,"").trim()||"story"}
+function download(content,name,mime){
+  const b=new Blob([content],{type:mime}),u=URL.createObjectURL(b),a=document.createElement("a");
+  a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);
+}
+function exportText(story,draft){
+  download(`${story.title}\n${draft.name} — exported ${fmtTime(now())}\n\n${assemble(story,draft).map(x=>x.text).join("\n\n")}\n`,
+    safeName(story.title)+".txt","text/plain");
+}
+function exportWord(story,draft){
+  const body=assemble(story,draft).map(x=>`<p>${esc(x.text).replace(/\n/g,"<br>")}</p>`).join("");
+  const html=`<html><head><meta charset="utf-8"><title>${esc(story.title)}</title><style>
+  body{font-family:Georgia,serif}p{font-size:12pt;line-height:1.6;margin:0 0 16px}h1{font-size:22pt}
+  </style></head><body><h1>${esc(story.title)}</h1><p>${esc(draft.name)} · exported ${fmtTime(now())}</p>${body}
+
+</body></html>`;
+  download(html,safeName(story.title)+".doc","application/msword");
+}
+function exportPdf(story,draft){
+  const body=assemble(story,draft).map(x=>`<p>${esc(x.text).replace(/\n/g,"<br>")}</p>`).join("");
+  const html=`<!doctype html><html><head><meta charset="utf-8"><title>${esc(story.title)}</title>
+  <style>@page{margin:2cm}body{font-family:Georgia,serif;max-width:700px;margin:auto}h1{font-size:26pt}p{font-size:12pt;line-height:1.7;margin:0 0 16pt}</style>
+  </head><body><h1>${esc(story.title)}</h1><p>${esc(draft.name)} · exported ${fmtTime(now())}</p>${body}</body></html>`;
+  const w=open("","_blank");
+  if(!w){alert("Please allow pop-ups to export PDF.");return}
+  w.document.write(html);w.document.close();w.onload=()=>setTimeout(()=>w.print(),250);
+}
+
+function BackupPanel({C,stories,backups,onClose,onRefresh,onRestore}){
+  const [file,setFile]=useState(null);
+  const createManual=async()=>{const b=await createBackup(stories,"Manual backup");if(!b){alert("Could not create the manual backup. Please try again.");return;}onRefresh();const data={format:"Manuscript Project Backup",version:5,exportedAt:now(),stories};const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"}),u=URL.createObjectURL(blob),a=document.createElement("a");a.href=u;a.download=`Manuscript_manual_backup_${new Date().toISOString().replace(/[:.]/g,"-")}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);alert("Manual backup created and downloaded successfully.");};
+  const download=()=>{const data={format:"Manuscript Project Backup",version:5,exportedAt:now(),stories};const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"}),u=URL.createObjectURL(blob),a=document.createElement("a");a.href=u;a.download=`Manuscript_manual_backup_${new Date().toISOString().replace(/[:.]/g,"-")}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);};
+  const importFile=()=>{if(!file)return;const r=new FileReader();r.onload=()=>{try{const x=JSON.parse(r.result);if(!validateProject(x.stories))throw new Error();onRestore({stories:x.stories,reason:"Imported manual backup",timestamp:x.exportedAt||now()});}catch(e){alert("Invalid Manuscript backup file.");}};r.readAsText(file);};
+  return <div style={S.modalBackdrop}><div style={{...S.modal(C),maxWidth:650}}><div style={S.modalHead}><div><b>🛡 Safety &amp; History</b><div style={S.meta(C)}>Auto backups are stored locally in IndexedDB and created at most once every 20 minutes. V5 keeps the same ManuscriptDB so your V4 data can carry forward.</div></div><button style={S.iconBtn(C)} onClick={onClose}>×</button></div><div style={S.backupSection}><div style={S.backupTitle}><b>Auto Backups</b><span style={S.meta(C)}>Keeps the newest {AUTO_BACKUP_LIMIT}</span></div>{backups.length?<div style={S.backupList}>{backups.slice().sort((a,b)=>b.timestamp-a.timestamp).map(b=><div key={b.id} style={S.backupRow(C)}><div><b>{b.reason}</b><div style={S.meta(C)}>{fmtTime(b.timestamp)}</div></div><button style={S.miniAction(C)} onClick={()=>onRestore(b)}>Restore</button></div>)}</div>:<div style={S.emptySmall(C)}>No auto backups yet. They appear after saved changes settle.</div>}</div><div style={S.backupActions}><button style={S.outline(C)} onClick={createManual}>Create manual backup</button><button style={S.outline(C)} onClick={download}>Download backup file</button></div><div style={S.backupSection}><b>Restore a downloaded backup</b><div style={{marginTop:8}}><input type="file" accept=".json,application/json" onChange={e=>setFile(e.target.files?.[0]||null)}/></div><button style={{...S.primary(C,!!file),marginTop:8}} disabled={!file} onClick={importFile}>Import &amp; restore</button></div><div style={S.modalFoot}><span style={S.meta(C)}>An emergency backup is created before restoring.</span><button style={S.miniAction(C)} onClick={onClose}>Close</button></div></div></div>;
+}
+function SearchPanel({C,stories,activeStoryId,setStories,onClose}){
+  const [query,setQuery]=useState(""),[replacement,setReplacement]=useState(""),[scope,setScope]=useState("all"),[results,setResults]=useState([]);
+  useEffect(()=>{if(!query){setResults([]);return;}const q=query.toLowerCase(),out=[];stories.order.forEach(sid=>{if(scope==="active"&&sid!==activeStoryId)return;const s=stories.byId[sid];s.sections.order.forEach(secId=>{const sec=s.sections.byId[secId];sec.variants.order.forEach(vId=>{const v=sec.variants.byId[vId],text=v.text||"",hits=text.toLowerCase().split(q).length-1;if(hits)out.push({sid,secId,vId,story:s.title,section:sec.name,version:sec.variants.order.indexOf(vId)+1,hits,text});});});});setResults(out);},[query,scope,stories,activeStoryId]);
+  const replaceAll=()=>{
+    const findText=String(query||"");
+    if(!findText||!results.length)return;
+    const replacementText=String(replacement??"");
+    if(!confirm(`Replace all matches in ${results.length} versions? Each change creates a new version and preserves the originals.`))return;
+    const escaped=findText.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+    const re=new RegExp(escaped,"gi");
+    const next=clone(stories);
+    let changed=0;
+    results.forEach(r=>{
+      if(scope==="active"&&r.sid!==activeStoryId)return;
+      const story=next.byId?.[r.sid];
+      const sec=story?.sections?.byId?.[r.secId];
+      const original=sec?.variants?.byId?.[r.vId];
+      if(!original)return;
+      const originalText=String(original.text||"");
+      re.lastIndex=0;
+      if(!re.test(originalText)){re.lastIndex=0;return;}
+      re.lastIndex=0;
+      const newId=uid();
+      const newText=originalText.replace(re,replacementText);
+      sec.variants.byId[newId]={
+        id:newId,
+        text:newText,
+        createdAt:now(),
+        note:`Find & replace: ${findText}${replacementText?` → ${replacementText}`:""}`,
+        restoredFrom:original.id
+      };
+      sec.variants.order.push(newId);
+      story.drafts.order.forEach(did=>{
+        const d=story.drafts.byId[did];
+        if(d&&d.selections?.[r.secId]===r.vId)d.selections[r.secId]=newId;
+      });
+      changed++;
+    });
+    if(!changed){alert("No matches were replaced.");return;}
+    setStories(next);
+    setQuery("");
+    setReplacement("");
+    alert(`Replaced ${changed} version${changed!==1?"s":""}. Original versions were preserved.`);
+  };
+
+  return <div style={S.modalBackdrop}><div style={{...S.modal(C),maxWidth:780}}><div style={S.modalHead}><div><b>⌕ Search &amp; Find / Replace</b><div style={S.meta(C)}>Searches every section and every version.</div></div><button style={S.iconBtn(C)} onClick={onClose}>×</button></div><div style={S.searchFields}><input autoFocus value={query} onChange={e=>setQuery(e.target.value)} placeholder="Find text…" style={S.searchInput(C)}/><input value={replacement} onChange={e=>setReplacement(e.target.value)} placeholder="Replace with…" style={S.searchInput(C)}/><select value={scope} onChange={e=>setScope(e.target.value)} style={S.statusSelect(C)}><option value="all">All stories</option><option value="active">Active story</option></select><button disabled={!results.length} style={S.primary(C,!!results.length)} onClick={replaceAll}>Replace all</button></div><div style={{margin:"10px 0"}}>{query?<span style={S.meta(C)}>{results.length} version{results.length!==1?"s":""} contain “{query}”.</span>:<span style={S.meta(C)}>Type a search term to begin.</span>}</div><div style={S.searchResults}>{results.slice(0,100).map((r,i)=><div key={r.sid+r.vId+i} style={S.resultRow(C)}><b>{r.story}</b><div style={S.meta(C)}>{r.section} · Version {r.version} · {r.hits} match{r.hits!==1?"es":""}</div><div style={S.preview(C)}>{truncate(r.text,180)}</div></div>)}</div></div></div>;
+}
+
+function FinalView({C,story,draft}){
+  return <section style={S.finalWrap(C)}><article style={S.finalPaper}>
+    <div style={S.finalTop}><span style={S.meta(C)}>{draft.name} · assembled {fmtTime(draft.createdAt)}</span>
+      <div style={S.exportRow}>
+        <button style={S.exportBtn(C)} onClick={()=>exportWord(story,draft)}>Export Word</button>
+        <button style={S.exportBtn(C)} onClick={()=>exportPdf(story,draft)}>Export PDF</button>
+        <button style={S.exportBtn(C)} onClick={()=>window.print()}>Print</button>
+        <button style={S.exportBtn(C)} onClick={()=>exportText(story,draft)}>Export text</button>
+      </div>
+    </div>
+    <div style={S.hint(C)}>Your manuscript is saved locally on this device. V5 can be installed as an app when served from HTTPS or localhost. Export a backup regularly; browser storage is not a replacement for backups. Use Print for a clean printout.</div>
+    <h1 style={S.finalTitle(C)}>{story.title}</h1>
+    {assemble(story,draft).map((p,i)=><p key={i} style={S.finalPara(C)}>{p.text||<i style={{color:C.inkSoft}}>[{p.name} is empty]</i>}</p>)}
+  </article></section>;
+}
+
+const S={
+  main:{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"},
+  row:{display:"flex",alignItems:"center",justifyContent:"space-between",gap:6},
+  meta:C=>({fontFamily:"monospace",fontSize:10.5,color:C.inkSoft}),
+  sidebar:C=>({width:220,minWidth:220,borderRight:`1px solid ${C.rule}`,background:C.paperDim,display:"flex",flexDirection:"column",padding:"18px 14px"}),
+  sidebarHeader:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20},
+  brandMark:C=>({fontFamily:"Georgia,serif",fontSize:22,color:C.sienna,marginRight:8}),
+  brandText:C=>({fontFamily:"monospace",fontSize:12,letterSpacing:".06em",textTransform:"uppercase",color:C.inkSoft}),
+  smallBtn:C=>({background:"transparent",border:`1px solid ${C.rule}`,borderRadius:5,width:24,height:24,cursor:"pointer",color:C.inkSoft}),
+  newBtn:C=>({background:C.ink,color:C.paper,border:"none",borderRadius:6,padding:"9px 12px",fontSize:13,cursor:"pointer",marginBottom:18}),
+  storyList:{display:"flex",flexDirection:"column",gap:4,overflowY:"auto",flex:1},
+  storyItem:(C,a)=>({padding:"9px 10px",borderRadius:6,cursor:"pointer",border:`1px solid ${a?C.rule:"transparent"}`,background:a?C.siennaLight:"transparent"}),
+  storyTitle:{fontSize:13.5,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1},
+  iconBtn:C=>({background:"transparent",border:"none",color:C.inkSoft,fontSize:15,cursor:"pointer"}),
+  save:C=>({display:"flex",alignItems:"center",gap:6,padding:"10px 6px 2px",borderTop:`1px solid ${C.rule}`,marginTop:10}),
+  dot:{width:6,height:6,borderRadius:"50%",flexShrink:0},
+  top:C=>({borderBottom:`1px solid ${C.rule}`,padding:"16px 28px 12px",background:C.paper}),
+  titleRow:{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,marginBottom:14},
+  leftBtns:{display:"flex",alignItems:"center",gap:6,flexShrink:0},
+  menuDrop:C=>({position:"absolute",top:"calc(100% + 5px)",right:0,zIndex:2000,minWidth:220,maxHeight:"70vh",overflowY:"auto",padding:5,background:C.paper,border:`1px solid ${C.rule}`,borderRadius:7,boxShadow:"0 10px 30px rgba(0,0,0,.14)"}),
+  menuItem:C=>({display:"block",width:"100%",textAlign:"left",border:"none",background:"transparent",color:C.ink,padding:"8px 10px",borderRadius:5,fontSize:12,cursor:"pointer"}),
+  outline:C=>({background:"transparent",border:`1px solid ${C.rule}`,borderRadius:6,padding:"6px 10px",fontSize:12,color:C.sienna,cursor:"pointer",whiteSpace:"nowrap"}),
+  title:C=>({fontFamily:"Georgia,serif",fontSize:24,fontWeight:600,margin:0,cursor:"text",flex:1,minWidth:0,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",color:C.ink}),
+  titleInput:C=>({fontFamily:"Georgia,serif",fontSize:24,fontWeight:600,border:"none",borderBottom:`2px solid ${C.sienna}`,background:"transparent",color:C.ink,width:"50%"}),
+  toggle:C=>({display:"flex",border:`1px solid ${C.rule}`,borderRadius:7,overflow:"hidden"}),
+  toggleBtn:(C,a)=>({background:a?C.ink:C.paper,color:a?C.paper:C.inkSoft,border:"none",padding:"7px 14px",fontSize:12.5,cursor:"pointer"}),
+  draftRow:{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"},
+  pills:{display:"flex",gap:6,flexWrap:"wrap"},
+  pill:(C,a)=>({display:"flex",alignItems:"center",border:`1px solid ${a?C.sienna:C.rule}`,borderRadius:6,background:a?C.siennaLight:C.paper}),
+  pillMain:{display:"flex",flexDirection:"column",padding:"5px 10px",cursor:"pointer",fontSize:12.5},
+  pillTime:C=>({fontFamily:"monospace",fontSize:9.5,color:C.inkSoft}),
+  pillDelete:C=>({border:"none",background:"transparent",color:C.inkSoft,cursor:"pointer",padding:"4px 7px"}),
+  pillInput:C=>({border:`1px solid ${C.sienna}`,borderRadius:6,padding:"6px 9px",background:C.paper,color:C.ink}),
+  addPill:C=>({padding:"6px 10px",border:`1px dashed ${C.rule}`,borderRadius:6,background:"transparent",fontSize:12,color:C.sienna,cursor:"pointer"}),
+  editGrid:{flex:1,display:"flex",overflow:"hidden"},
+  rail:C=>({width:250,minWidth:250,borderRight:`1px solid ${C.rule}`,padding:"16px 12px",overflowY:"auto",display:"flex",flexDirection:"column"}),
+  heading:C=>({fontFamily:"monospace",fontSize:10.5,textTransform:"uppercase",letterSpacing:".06em",color:C.inkSoft,marginBottom:12}),
+  railList:{display:"flex",flexDirection:"column",gap:6,flex:1},
+  railItem:(C,a)=>({padding:"9px 10px",borderRadius:6,cursor:"pointer",border:`1px solid ${a?C.rule:"transparent"}`,background:a?C.siennaLight:"transparent"}),
+  railTop:{display:"flex",alignItems:"baseline",gap:8,fontSize:13.5,fontWeight:500},
+  index:C=>({fontFamily:"monospace",fontSize:10.5,color:C.sienna}),
+  moveRow:{display:"flex",gap:4,marginTop:5,marginLeft:24},
+  moveBtn:C=>({border:`1px solid ${C.rule}`,background:C.paper,borderRadius:4,fontSize:10,padding:"2px 7px",cursor:"pointer",color:C.inkSoft}),
+  addSection:C=>({marginTop:10,background:"transparent",border:`1px dashed ${C.rule}`,borderRadius:6,padding:"8px 10px",fontSize:12.5,color:C.sienna,cursor:"pointer"}),
+  empty:C=>({flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:C.inkSoft}),
+  workspace:C=>({flex:1,padding:"20px 32px 32px",overflowY:"auto",display:"flex",flexDirection:"column",color:C.ink}),
+  workspaceInner:{display:"flex",flexDirection:"column",width:"100%"},
+  wide:{maxWidth:760,margin:"0 auto"},
+  workspaceHeader:{display:"flex",alignItems:"baseline",gap:12,marginBottom:10,flexWrap:"wrap"},
+  sectionName:C=>({fontFamily:"Georgia,serif",fontSize:19,fontWeight:600,margin:0,cursor:"text"}),
+  sectionInput:C=>({fontFamily:"Georgia,serif",fontSize:19,fontWeight:600,border:"none",borderBottom:`2px solid ${C.sienna}`,background:"transparent",color:C.ink}),
+  textarea:C=>({width:"100%",minHeight:180,resize:"vertical",border:`1px solid ${C.rule}`,borderRadius:8,padding:16,fontFamily:"Georgia,serif",fontSize:16,lineHeight:1.6,color:C.ink,background:C.paper}),
+  wordCount:C=>({fontFamily:"monospace",fontSize:11,color:C.sienna,marginTop:7,padding:"5px 8px",border:`1px solid ${C.rule}`,borderRadius:5,display:"inline-block",background:C.paperDim}),
+  actionRow:{display:"flex",alignItems:"center",gap:10,marginTop:10,flexWrap:"wrap"},
+  primary:(C,on)=>({background:C.ink,color:C.paper,border:"none",borderRadius:6,padding:"8px 14px",fontSize:12.5,cursor:on?"pointer":"not-allowed",opacity:on?1:.35}),
+  ghost:(C,on)=>({background:"transparent",color:C.ink,border:`1px solid ${C.rule}`,borderRadius:6,padding:"8px 14px",fontSize:12.5,cursor:on?"pointer":"not-allowed",opacity:on?1:.35}),
+  versionRow:{display:"flex",gap:12},
+  track:C=>({display:"flex",flexDirection:"column",alignItems:"center",width:14}),
+  dot:(C,a)=>({width:10,height:10,borderRadius:"50%",background:a?C.sienna:C.paper,border:`2px solid ${a?C.sienna:C.rule}`,marginTop:6,flexShrink:0}),
+  line:C=>({width:2,flex:1,background:C.rule,minHeight:30}),
+  card:(C,a)=>({flex:1,border:`1px solid ${a?C.sienna:C.rule}`,borderRadius:8,padding:"10px 12px",marginBottom:14,cursor:"pointer",background:a?C.siennaLight:C.paper}),
+  cardTop:{display:"flex",justifyContent:"space-between",marginBottom:5},
+  preview:C=>({fontFamily:"Georgia,serif",fontSize:13.5,lineHeight:1.5,color:C.inkSoft,marginBottom:6}),
+  cardBottom:{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8},
+  note:C=>({fontFamily:"monospace",fontSize:10,color:C.sienna,fontStyle:"italic",cursor:"pointer",background:"transparent",border:"none",padding:0,textAlign:"left"}),
+  noteInput:C=>({fontFamily:"monospace",fontSize:10,border:`1px solid ${C.rule}`,background:C.paper,color:C.ink,padding:4,borderRadius:4,flex:1}),
+  deleteText:C=>({background:"transparent",border:"none",color:C.inkSoft,fontSize:10.5,cursor:"pointer",textDecoration:"underline"}),
+  utilityRow:{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:8,marginTop:-6,marginBottom:10,flexWrap:"wrap"},
+  timerBox:C=>({display:"flex",alignItems:"center",gap:7,border:`1px solid ${C.rule}`,borderRadius:6,padding:"4px 7px",background:C.paperDim}),
+  timerLabel:C=>({fontFamily:"monospace",fontSize:9,color:C.inkSoft,letterSpacing:".08em"}),
+  timerValue:C=>({fontFamily:"monospace",fontSize:12,minWidth:60,textAlign:"center",color:C.ink}),
+  timerBtn:C=>({border:"none",background:C.ink,color:C.paper,borderRadius:4,padding:"4px 7px",fontSize:10,cursor:"pointer"}),
+  timerReset:C=>({border:`1px solid ${C.rule}`,background:"transparent",color:C.inkSoft,borderRadius:4,padding:"3px 6px",fontSize:10,cursor:"pointer"}),
+  dailyBox:C=>({display:"flex",alignItems:"center",gap:7,border:`1px solid ${C.rule}`,borderRadius:6,padding:"6px 9px",background:C.paper}),
+  renameDraftBox:C=>({display:"flex",alignItems:"center",gap:4,border:`1px solid ${C.sienna}`,borderRadius:6,padding:3,background:C.paper}),
+  miniAction:C=>({border:`1px solid ${C.rule}`,background:C.paper,color:C.inkSoft,borderRadius:4,padding:"4px 7px",fontSize:10,cursor:"pointer",whiteSpace:"nowrap"}),
+  pillEdit:C=>({border:"none",background:"transparent",color:C.inkSoft,cursor:"pointer",padding:"4px 3px",fontSize:11}),
+  noteEditor:{display:"flex",alignItems:"center",gap:4,flex:1},
+  statusSelect:C=>({border:`1px solid ${C.rule}`,borderRadius:5,padding:"5px 7px",background:C.paper,color:C.ink,fontSize:11}),
+  editorTools:C=>({display:"flex",alignItems:"center",gap:6,marginBottom:8,flexWrap:"wrap"}),
+  historyBtn:(C,on)=>({background:on?C.ink:"transparent",color:on?C.paper:C.inkSoft,border:`1px solid ${on?C.ink:C.rule}`,borderRadius:5,padding:"5px 9px",fontSize:11,cursor:on?"pointer":"not-allowed",opacity:on?1:.45}),
+  historyInfo:C=>({fontFamily:"monospace",fontSize:9.5,color:C.inkSoft}),
+  versionActions:{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap"},
+  modalBackdrop:{position:"fixed",inset:0,background:"rgba(0,0,0,.42)",display:"flex",alignItems:"center",justifyContent:"center",padding:16,zIndex:1000},
+  modal:C=>({background:C.paper,color:C.ink,border:`1px solid ${C.rule}`,borderRadius:10,boxShadow:"0 18px 60px rgba(0,0,0,.25)",width:"100%",maxWidth:680,maxHeight:"90vh",overflowY:"auto",padding:18}),
+  modalHead:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:14},
+  modalFoot:{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginTop:16,flexWrap:"wrap"},
+  modalText:C=>({color:C.inkSoft,fontSize:13,lineHeight:1.5}),
+  compareGrid:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10},
+  comparePane:C=>({margin:0,padding:10,border:`1px solid ${C.rule}`,borderRadius:6,background:C.paperDim,color:C.ink,fontFamily:"monospace",fontSize:11,lineHeight:1.5,maxHeight:360,overflow:"auto",whiteSpace:"pre-wrap"}),
+  backupSection:{marginTop:14,paddingTop:12,borderTop:"1px solid transparent"},
+  backupTitle:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8},
+  backupList:{display:"flex",flexDirection:"column",gap:6,maxHeight:280,overflowY:"auto"},
+  backupRow:C=>({display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,padding:"8px 9px",border:`1px solid ${C.rule}`,borderRadius:6,background:C.paperDim}),
+  backupActions:{display:"flex",gap:8,flexWrap:"wrap",marginTop:12},
+  emptySmall:C=>({fontSize:12,color:C.inkSoft,padding:"8px 0"}),
+  searchFields:{display:"grid",gridTemplateColumns:"1fr 1fr auto auto",gap:7,alignItems:"center"},
+  searchInput:C=>({border:`1px solid ${C.rule}`,borderRadius:6,padding:"8px 9px",background:C.paper,color:C.ink,fontSize:12}),
+  searchResults:{display:"flex",flexDirection:"column",gap:6,maxHeight:420,overflowY:"auto"},
+  resultRow:C=>({padding:9,border:`1px solid ${C.rule}`,borderRadius:6,background:C.paperDim}),
+  finalWrap:C=>({flex:1,overflowY:"auto",display:"flex",justifyContent:"center",padding:"40px 20px",background:C.paper}),
+  finalPaper:{maxWidth:700,width:"100%"},
+  finalTop:{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:12,flexWrap:"wrap",marginBottom:10},
+  exportRow:{display:"flex",gap:8,flexWrap:"wrap"},
+  exportBtn:C=>({background:"transparent",border:`1px solid ${C.rule}`,borderRadius:6,padding:"6px 11px",fontSize:11.5,color:C.sienna,cursor:"pointer"}),
+  hint:C=>({fontSize:11.5,color:C.inkSoft,lineHeight:1.5,background:C.paperDim,border:`1px solid ${C.rule}`,borderRadius:6,padding:"8px 10px",marginBottom:22}),
+  finalTitle:C=>({fontFamily:"Georgia,serif",fontSize:34,fontWeight:600,marginBottom:26,color:C.ink}),
+  finalPara:C=>({fontFamily:"Georgia,serif",fontSize:17,lineHeight:1.75,color:C.ink,marginBottom:20})
+};
+
+function baseApp(C){
+  return {display:"flex",height:"100vh",width:"100%",background:C.paper,color:C.ink,overflow:"hidden"};
+}
+
+const root=ReactDOM.createRoot(document.getElementById("root"));
+class ErrorBoundary extends React.Component{
+  constructor(p){super(p);this.state={error:null}}
+  static getDerivedStateFromError(error){return{error}}
+  render(){
+    if(this.state.error)return <div style={{padding:24,fontFamily:"monospace",whiteSpace:"pre-wrap"}}><b>Something broke while rendering.</b><br/><br/>{String(this.state.error?.message||this.state.error)}</div>;
+    return this.props.children;
+  }
+}
+root.render(<ErrorBoundary><StoryApp/></ErrorBoundary>);
+window.__manuscriptMounted=true;
+
+if("serviceWorker" in navigator){
+  window.addEventListener("load",()=>{
+    navigator.serviceWorker.register("./sw.js",{scope:"./"}).catch(err=>console.warn("Service worker registration failed:",err));
+  });
+}
+</script>
+</body>
+</html>
